@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import ssl
 import sys
 import time
 import shutil
@@ -16,7 +15,7 @@ import google_auth_httplib2
 import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError, ResumableUploadError
+from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
@@ -35,14 +34,7 @@ IGNORED_FOLDERS_FILE = "ignored_folders.txt"
 LAST_STATUS_LEN = 0
 DEFAULT_UPLOAD_CHUNK_MB = 8
 DEFAULT_HTTP_TIMEOUT_SECONDS = 120
-DEFAULT_UPLOAD_RETRIES = 5
 RATE_LIMIT_RETRY_SECONDS = 60 * 30
-RETRYABLE_UPLOAD_EXCEPTIONS = (
-    httplib2.HttpLib2Error,
-    ConnectionError,
-    TimeoutError,
-    ssl.SSLError,
-)
 
 
 @dataclass(frozen=True)
@@ -159,12 +151,6 @@ def update_file_state(state: dict, state_path: Path, rel_key: str, **fields) -> 
     save_json(state_path, state)
 
 
-def remove_file_state(state: dict, state_path: Path, rel_key: str) -> None:
-    if rel_key in state.get("files", {}):
-        state["files"].pop(rel_key, None)
-        save_json(state_path, state)
-
-
 def parse_folder(folder: Path) -> Optional[FolderInfo]:
     match = DATE_FOLDER_RE.match(folder.name)
     if not match:
@@ -215,14 +201,15 @@ def build_youtube_client(creds: Credentials, timeout_seconds: int):
 
 
 def retry_delay_seconds(attempt: int) -> int:
-    return min(2**attempt, 60)
+    return min(2 ** min(attempt, 6), 60)
 
 
-def format_upload_retry_error(exc: BaseException) -> str:
+def format_retry_error(exc: BaseException) -> str:
     winerror = getattr(exc, "winerror", None)
+    detail = " ".join(str(exc).split())
     if winerror:
-        return f"{type(exc).__name__} [WinError {winerror}]: {exc}"
-    return f"{type(exc).__name__}: {exc}"
+        detail = f"WinError {winerror}" if not detail else f"WinError {winerror}: {detail}"
+    return truncate_middle(f"{type(exc).__name__}: {detail}", 140)
 
 
 def is_rate_limit_error(exc: HttpError) -> bool:
@@ -230,15 +217,29 @@ def is_rate_limit_error(exc: HttpError) -> bool:
     return exc.resp.status == 429 or "rate_limit_exceeded" in message
 
 
-def execute_with_rate_limit_retry(request):
+def retry_forever(action, label: str):
+    """Retry every operational failure until the user explicitly interrupts."""
+    attempt = 0
     while True:
         try:
-            return request.execute()
-        except HttpError as exc:
-            if not is_rate_limit_error(exc):
-                raise
-            print("rate limit exceeded")
-            time.sleep(RATE_LIMIT_RETRY_SECONDS)
+            result = action()
+            if attempt:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                global LAST_STATUS_LEN
+                LAST_STATUS_LEN = 0
+            return result
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
+            delay = RATE_LIMIT_RETRY_SECONDS if isinstance(exc, HttpError) and is_rate_limit_error(exc) else retry_delay_seconds(attempt)
+            write_status_line(f"{label} failed; retrying in {format_eta(delay)} ({format_retry_error(exc)})")
+            attempt += 1
+            time.sleep(delay)
+
+
+def execute_with_retry(request, label: str):
+    return retry_forever(request.execute, label)
 
 
 def fetch_channel_uploaded_titles(youtube) -> set[str]:
@@ -247,7 +248,7 @@ def fetch_channel_uploaded_titles(youtube) -> set[str]:
         mine=True,
         maxResults=1,
     )
-    channels_response = execute_with_rate_limit_retry(channels_response)
+    channels_response = execute_with_retry(channels_response, "Channel lookup")
     items = channels_response.get("items", [])
     if not items:
         return set()
@@ -263,7 +264,7 @@ def fetch_channel_uploaded_titles(youtube) -> set[str]:
         maxResults=50,
     )
     while request is not None:
-        response = execute_with_rate_limit_retry(request)
+        response = execute_with_retry(request, "Upload list lookup")
         for item in response.get("items", []):
             snippet = item.get("snippet", {})
             title = snippet.get("title")
@@ -279,7 +280,7 @@ def fetch_channel_uploaded_videos(youtube) -> dict[str, str]:
         mine=True,
         maxResults=1,
     )
-    channels_response = execute_with_rate_limit_retry(channels_response)
+    channels_response = execute_with_retry(channels_response, "Channel lookup")
     items = channels_response.get("items", [])
     if not items:
         return {}
@@ -295,7 +296,7 @@ def fetch_channel_uploaded_videos(youtube) -> dict[str, str]:
         maxResults=50,
     )
     while request is not None:
-        response = execute_with_rate_limit_retry(request)
+        response = execute_with_retry(request, "Upload list lookup")
         for item in response.get("items", []):
             snippet = item.get("snippet", {})
             title = snippet.get("title")
@@ -316,7 +317,7 @@ def ensure_playlist(youtube, playlists_cache: dict[str, str], title: str) -> str
         maxResults=50,
     )
     while request is not None:
-        response = execute_with_rate_limit_retry(request)
+        response = execute_with_retry(request, "Playlist lookup")
         for item in response.get("items", []):
             snippet = item.get("snippet", {})
             status = item.get("status", {})
@@ -335,7 +336,7 @@ def ensure_playlist(youtube, playlists_cache: dict[str, str], title: str) -> str
             "status": {"privacyStatus": "unlisted"},
         },
     )
-    created = execute_with_rate_limit_retry(created)
+    created = execute_with_retry(created, "Playlist creation")
     playlists_cache[title] = created["id"]
     return created["id"]
 
@@ -345,7 +346,6 @@ def upload_video(
     file_path: Path,
     title: str,
     chunk_size_mb: int,
-    retries: int,
 ) -> str:
     chunk_size = chunk_size_mb * 1024 * 1024
     media = MediaFileUpload(str(file_path), chunksize=chunk_size, resumable=True)
@@ -368,20 +368,21 @@ def upload_video(
     start_time = time.monotonic()
     last_percent = -1
     try:
+        attempt = 0
         while response is None:
-            for attempt in range(retries + 1):
-                try:
-                    status, response = request.next_chunk(num_retries=retries)
-                    break
-                except RETRYABLE_UPLOAD_EXCEPTIONS as exc:
-                    if attempt >= retries:
-                        raise
-                    delay = retry_delay_seconds(attempt)
-                    write_status_line(
-                        f"Upload connection error: {format_upload_retry_error(exc)}. Retrying in {delay}s "
-                        f"({attempt + 1}/{retries})..."
-                    )
-                    time.sleep(delay)
+            try:
+                status, response = request.next_chunk(num_retries=0)
+                attempt = 0
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:
+                delay = RATE_LIMIT_RETRY_SECONDS if isinstance(exc, HttpError) and is_rate_limit_error(exc) else retry_delay_seconds(attempt)
+                write_status_line(
+                    f"Upload retry in {format_eta(delay)} ({format_retry_error(exc)})"
+                )
+                attempt += 1
+                time.sleep(delay)
+                continue
             if status:
                 total = status.total_size or 0
                 current = status.resumable_progress or 0
@@ -485,7 +486,7 @@ def add_video_to_playlist(youtube, playlist_id: str, video_id: str) -> None:
             }
         },
     )
-    execute_with_rate_limit_retry(request)
+    execute_with_retry(request, "Playlist update")
 
 
 def discover_date_folders(root: Path) -> list[FolderInfo]:
@@ -641,12 +642,6 @@ def main() -> int:
         default=DEFAULT_HTTP_TIMEOUT_SECONDS,
         help=f"Seconds to wait on a stalled Google API socket before failing/retrying. Default: {DEFAULT_HTTP_TIMEOUT_SECONDS}.",
     )
-    parser.add_argument(
-        "--upload-retries",
-        type=int,
-        default=DEFAULT_UPLOAD_RETRIES,
-        help=f"Retries per upload chunk for transient errors. Default: {DEFAULT_UPLOAD_RETRIES}.",
-    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -670,9 +665,6 @@ def main() -> int:
         return 1
     if args.request_timeout <= 0:
         print("--request-timeout must be greater than 0.")
-        return 1
-    if args.upload_retries < 0:
-        print("--upload-retries cannot be negative.")
         return 1
 
     folders = discover_date_folders(root)
@@ -753,20 +745,7 @@ def main() -> int:
                     item.path,
                     item.title,
                     args.upload_chunk_mb,
-                    args.upload_retries,
                 )
-            except (HttpError, ResumableUploadError) as exc:
-                message = str(exc)
-                if "Video Uploads per day" in message or "quota exceeded" in message.lower():
-                    remove_file_state(state, state_path, rel_key)
-                    print("\nUpload quota was exceeded for today. Nothing was uploaded for this file.")
-                    print("The file has been returned to the queue, so you can retry later.")
-                    return 1
-                raise
-            except RETRYABLE_UPLOAD_EXCEPTIONS as exc:
-                print(f"\nUpload stopped after connection retries: {format_upload_retry_error(exc)}")
-                print("The current file is still marked as 'uploading'; rerun the script to retry it.")
-                return 1
             except KeyboardInterrupt:
                 print("\nUpload interrupted. Current file state was saved as 'uploading'.")
                 raise
@@ -788,4 +767,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unexpected_attempt = 0
+    while True:
+        try:
+            raise SystemExit(main())
+        except KeyboardInterrupt:
+            print("\nStopped by user. Progress was saved.")
+            raise SystemExit(130)
+        except SystemExit:
+            raise
+        except BaseException as exc:
+            delay = retry_delay_seconds(unexpected_attempt)
+            write_status_line(f"Unexpected error; retrying in {format_eta(delay)} ({format_retry_error(exc)})")
+            unexpected_attempt += 1
+            time.sleep(delay)
+

@@ -103,7 +103,7 @@ python "F:\Media\GoPro Hero 7\YT Uploader\upload_to_youtube.py" --reauth --auth-
 Adjust resumable upload behavior:
 
 ```powershell
-python "F:\Media\GoPro Hero 7\YT Uploader\upload_to_youtube.py" --upload-chunk-mb 8 --request-timeout 120 --upload-retries 5
+python "F:\Media\GoPro Hero 7\YT Uploader\upload_to_youtube.py" --upload-chunk-mb 8 --request-timeout 120
 ```
 
 ## Title format
@@ -142,6 +142,7 @@ Example:
 - It skips files already marked as uploaded in `state.json`.
 - It only processes valid video extensions: `.mp4`, `.mov`, `.m4v`, `.avi`, and `.mkv`.
 - A dry run is the safest way to review the queue before uploading.
+- Upload and YouTube API errors retry automatically until you stop the process with `Ctrl+C` or close its terminal. Retry messages replace one compact status line instead of filling the terminal.
 
 ## Troubleshooting
 
